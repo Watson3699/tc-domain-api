@@ -1,26 +1,36 @@
 """
-Triple-Convergence Acoustic Diagnostic Engine v2.0
-===================================================
+tc_engine_v3.py
+===============
 AW IP Holdings Inc. | CONFIDENTIAL — Trade Secret
-Document: TC-ENG-CORE-002
+Document: TC-ENG-CORE-003
 
-Four-channel Coherence Convergence Index (CCI):
-  CH-01  Gutenberg-Richter b-value          weight 0.30
-  CH-02  Eigen-tracked Kalman κ(P)          weight 0.25
-  CH-03  Spectral k-ratio [NDA-gated stub]  weight 0.25
-  CH-04  Adaptive AR(p) + Ljung-Box         weight 0.20
+Triple-Convergence Acoustic Diagnostic Engine v3.0
+===================================================
+Upgrade from v2.0:
+  - CH-03 k-ratio stub REPLACED by AttractorDrift (phase-space geometry)
+  - CH-05 PLV (Phase Locking Value) ADDED — phase coupling channel
+  - Domain-specific CCI weight tables (seismic / volcanic / structural)
+  - Multi-window persistence gate — alert suppressed until N of M windows confirm
+  - IAAFT surrogate rejection gate — alert downgraded if CCI indistinguishable
+    from linear-phase-shuffled surrogate (kills linear false alarms)
+  - Confidence score output: persistence × surrogate_gate × data_quality
+  - Expanded validation output schema: lead-time, z-score vs surrogate,
+    surrogate_mean, first_warning_window, status
 
-DWT multi-scale decomposition conditions the waveform and feeds the
-Kalman observation vector internally. It is not a public channel and
-band_energies are never returned in API responses.
+Five-channel CCI (domain-specific weights — see domain_weights.py):
+  CH-01  Gutenberg-Richter b-value       (stress accumulation proxy)
+  CH-02  Eigen-tracked Kalman κ(P)       (covariance geometry drift)
+  CH-03  AttractorDrift                  (recurrence threshold drift)
+  CH-04  PLV Phase Locking Value         (inter-mode phase coupling)
+  CH-05  Adaptive AR(p) + Ljung-Box      (temporal clustering)
 
-Engine internals (weights, thresholds, k-ratio formula) are trade
-secrets and are never returned in any API response.
+DWT multi-scale decomposition conditions the Kalman observation vector
+internally. Band energies are never returned in API responses.
 
-Build note: TC-ENGINE-2025-V2-SIM-STUB indicates the k-ratio channel
-is running on an interface-contract stub — a deterministic placeholder
-that is NOT the production k-ratio formula. Upgrade build tag to
-TC-ENGINE-2025-V2-PROD after the NDA-gated production module is installed.
+Engine internals (weights, thresholds, channel formulas) are trade
+secrets of AW IP Holdings Inc. and are never returned in any API response.
+
+Build tag: TC-ENGINE-2025-V3-PROD
 """
 from __future__ import annotations
 
@@ -32,25 +42,25 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import signal as sp_signal
+from scipy.signal import find_peaks
+
+from spectral_geometry import AttractorDrift
+from plv_channel import PLVChannel
+from domain_weights import (
+    get_domain_config,
+    THRESHOLD_ADVISORY,
+    THRESHOLD_WARNING,
+    THRESHOLD_CRITICAL,
+    SURROGATE_Z_MIN,
+    CONFIDENCE_FLOOR,
+)
+from persistence import PersistenceGate
+from surrogate import SurrogateGate
 
 # ── BUILD CONSTANTS ───────────────────────────────────────────────────────────
 
-VERSION   = "2.0.0"
-BUILD_TAG = "TC-ENGINE-2025-V2-SIM-STUB"
-
-# CCI channel weights — trade secret, never exposed in API responses
-_CCI_WEIGHTS: Dict[str, float] = {
-    "b_value":   0.30,
-    "kappa":     0.25,
-    "k_ratio":   0.25,
-    "ljung_box": 0.20,
-}
-assert abs(sum(_CCI_WEIGHTS.values()) - 1.0) < 1e-9
-
-# Alert thresholds — trade secret, never exposed in API responses
-_THRESHOLD_ADVISORY = 0.65
-_THRESHOLD_WARNING  = 0.78
-_THRESHOLD_CRITICAL = 0.88
+VERSION   = "3.0.0"
+BUILD_TAG = "TC-ENGINE-2025-V3-PROD"
 
 # Internal config
 _LB_HISTORY_LEN = 120
@@ -58,8 +68,8 @@ _LB_LAG_DEFAULT = 10
 _DWT_LEVEL      = 4
 _KALMAN_DIM     = 4
 
-# Whitelist of metadata keys safe to return in public API responses
-_PUBLIC_METADATA_KEYS: frozenset = frozenset({"n_events", "flagged", "level"})
+# Whitelist of metadata keys safe to return in API responses
+_PUBLIC_METADATA_KEYS: frozenset = frozenset({"n_events", "flagged", "level", "rising"})
 
 
 # ── DATA STRUCTURES ───────────────────────────────────────────────────────────
@@ -69,26 +79,25 @@ class ChannelResult:
     normalised: float
     label:      str
     metadata:   Dict = field(default_factory=dict)
-    # raw values intentionally omitted — never pass raw to API responses
 
 
 @dataclass
 class EngineOutput:
-    timestamp:    float
-    cci:          float
-    alert_level:  str
-    channels:     Dict[str, ChannelResult] = field(default_factory=dict)
-    audit_hash:   str = ""
-    sample_count: int = 0
+    timestamp:          float
+    cci:                float
+    alert_level:        str          # persistence-gated level
+    raw_alert_level:    str          # raw CCI threshold level (no persistence)
+    domain:             str
+    channels:           Dict[str, ChannelResult] = field(default_factory=dict)
+    audit_hash:         str  = ""
+    sample_count:       int  = 0
+    persistence_score:  float = 0.0  # fraction toward gate satisfaction
+    confidence:         float = 0.0  # composite confidence [0,1]
+    surrogate_z:        float = 0.0  # z-score vs IAAFT surrogate (0 = not tested)
+    surrogate_tested:   bool  = False
 
 
 # ── LAYER 1 — MULTI-SCALE DWT (internal only) ─────────────────────────────────
-
-def _haar_filters() -> Tuple[np.ndarray, np.ndarray]:
-    lo = np.array([1.0, 1.0]) / np.sqrt(2)
-    hi = np.array([1.0, -1.0]) / np.sqrt(2)
-    return lo, hi
-
 
 def _db4_filters() -> Tuple[np.ndarray, np.ndarray]:
     c  = np.array([0.48296291314469025, 0.83651630373746899,
@@ -108,7 +117,7 @@ def _dwt_level(x: np.ndarray, lo: np.ndarray,
 
 def _dwt_energy_profile(x: np.ndarray,
                          level: int = _DWT_LEVEL) -> Tuple[np.ndarray, float]:
-    """Internal DWT decomposition — band_energies never leave this module."""
+    """Internal DWT — band_energies never leave this function."""
     lo, hi    = _db4_filters()
     approx    = x.astype(float).copy()
     det_e: List[float] = []
@@ -127,11 +136,6 @@ def _dwt_energy_profile(x: np.ndarray,
     return norm_e, mig
 
 
-def _compute_dwt_internal(waveform: np.ndarray) -> Tuple[np.ndarray, float]:
-    """DWT used internally only. Returns (band_energies, migration_index)."""
-    return _dwt_energy_profile(waveform)
-
-
 # ── LAYER 2 — EIGEN-TRACKED KALMAN ───────────────────────────────────────────
 
 class _EigenKalman:
@@ -147,26 +151,25 @@ class _EigenKalman:
         self.H   = np.eye(dim)
         self._kappa_hist: Deque[float] = deque(maxlen=50)
 
-    def update(self, z: np.ndarray) -> Tuple[float, float]:
+    def update(self, z: np.ndarray) -> float:
         x_pred = self.F @ self.x
         P_pred = self.F @ self.P @ self.F.T + self.Q
         S      = self.H @ P_pred @ self.H.T + self.R
         K      = P_pred @ self.H.T @ np.linalg.inv(S)
         self.x = x_pred + K @ (z - self.H @ x_pred)
         self.P = (np.eye(self.dim) - K @ self.H) @ P_pred
-        eigs        = np.abs(np.linalg.eigvalsh(self.P))
-        kappa       = float(eigs.max() / max(eigs.min(), 1e-12))
+        eigs       = np.abs(np.linalg.eigvalsh(self.P))
+        kappa      = float(eigs.max() / max(eigs.min(), 1e-12))
         self._kappa_hist.append(kappa)
-        p95         = float(np.percentile(np.array(self._kappa_hist), 95))
-        kappa_norm  = float(np.clip(kappa / max(p95, 1.0), 0.0, 1.0))
-        return kappa, kappa_norm   # kappa (raw) never forwarded to API response
+        p95        = float(np.percentile(np.array(self._kappa_hist), 95))
+        kappa_norm = float(np.clip(kappa / max(p95, 1.0), 0.0, 1.0))
+        return kappa_norm   # raw kappa intentionally discarded
 
 
 def _compute_kalman_channel(obs: np.ndarray, kf: _EigenKalman) -> ChannelResult:
     z = np.zeros(kf.dim)
     z[:min(len(obs), kf.dim)] = obs[:kf.dim]
-    _kappa_raw, kappa_norm = kf.update(z)
-    # _kappa_raw intentionally discarded — not stored in metadata
+    kappa_norm = kf.update(z)
     return ChannelResult(
         normalised=kappa_norm,
         label="Kalman covariance geometry",
@@ -233,7 +236,6 @@ class _AdaptiveLjungBox:
         residuals = self._ar_residuals(x)
         q_stat    = _lb_statistic(residuals, self.lags)
         p_value   = _chi2_sf(q_stat, self.lags)
-        # p_value and z_score are internal — not forwarded to API response
         if len(self._p_hist) >= 10:
             p_arr   = np.array(self._p_hist)
             z_score = (p_arr.mean() - p_value) / (p_arr.std() + 1e-9)
@@ -257,33 +259,6 @@ def _compute_lb_channel(window: np.ndarray, alb: _AdaptiveLjungBox) -> ChannelRe
     )
 
 
-# ── K-RATIO STUB (NDA-gated) ──────────────────────────────────────────────────
-
-def _compute_k_ratio_channel(waveform: np.ndarray) -> ChannelResult:
-    """
-    Proprietary spectral k-ratio — full methodology is a trade secret of
-    AW IP Holdings Inc., disclosed only under executed NDA.
-
-    This stub returns a deterministic interface-contract placeholder and is
-    NOT the production k-ratio formula. The placeholder uses a simple
-    time-domain energy split that has no relationship to the production
-    spectral methodology.
-
-    Build tag remains TC-ENGINE-2025-V2-SIM-STUB until the production
-    module is installed.
-    """
-    n    = len(waveform)
-    mid  = n // 2
-    lo   = float(np.mean(waveform[:mid] ** 2)) + 1e-12
-    hi   = float(np.mean(waveform[mid:] ** 2)) + 1e-12
-    norm = float(np.clip(1.0 / (1.0 + hi / lo), 0.0, 1.0))
-    return ChannelResult(
-        normalised=norm,
-        label="Spectral coherence index",
-        metadata={},
-    )
-
-
 # ── G-R B-VALUE ───────────────────────────────────────────────────────────────
 
 def _compute_b_value_channel(magnitudes: np.ndarray,
@@ -298,7 +273,6 @@ def _compute_b_value_channel(magnitudes: np.ndarray,
                              metadata={"n_events": int(len(m))})
     b    = np.log10(np.e) / dm
     norm = float(np.clip((1.3 - b) / 1.0, 0.0, 1.0))
-    # b value itself is internal — only n_events exposed
     return ChannelResult(
         normalised=norm,
         label="Stress index",
@@ -306,37 +280,10 @@ def _compute_b_value_channel(magnitudes: np.ndarray,
     )
 
 
-# ── CCI COMPOSITE ─────────────────────────────────────────────────────────────
-
-def _compute_cci(channels: Dict[str, ChannelResult]) -> float:
-    cci = sum(
-        w * (channels[k].normalised if k in channels else 0.0)
-        for k, w in _CCI_WEIGHTS.items()
-    )
-    return float(np.clip(cci, 0.0, 1.0))
-
-
-def _cci_to_alert(cci: float) -> str:
-    if cci >= _THRESHOLD_CRITICAL: return "CRITICAL"
-    if cci >= _THRESHOLD_WARNING:  return "WARNING"
-    if cci >= _THRESHOLD_ADVISORY: return "ADVISORY"
-    return "NOMINAL"
-
-
-def _audit_hash(cci: float, ts: float, run: int) -> str:
-    payload = f"{BUILD_TAG}|{cci:.6f}|{ts:.2f}|{run}"
-    return hashlib.sha256(payload.encode()).hexdigest()
-
-
-# ── MAGNITUDE SYNTHESIS (deterministic) ──────────────────────────────────────
+# ── MAGNITUDE SYNTHESIS ───────────────────────────────────────────────────────
 
 def _synthesise_magnitudes(waveform: np.ndarray, n_events: int = 30) -> np.ndarray:
-    """
-    Derive proxy magnitude catalogue from waveform envelope peaks.
-    Fallback is deterministic: seeded from waveform content hash.
-    """
     envelope = np.abs(sp_signal.hilbert(waveform))
-    from scipy.signal import find_peaks
     peaks, _ = find_peaks(envelope, distance=max(1, len(waveform) // (n_events * 2)))
     if len(peaks) < 3:
         seed = int(hashlib.md5(waveform.tobytes()).hexdigest()[:8], 16) % (2 ** 32)
@@ -352,24 +299,35 @@ def _synthesise_magnitudes(waveform: np.ndarray, n_events: int = 30) -> np.ndarr
 # ── INPUT VALIDATION ──────────────────────────────────────────────────────────
 
 def _validate_waveform(waveform: np.ndarray) -> np.ndarray:
-    """Centralised waveform guard — called at engine boundary."""
-    if waveform is None or len(waveform) < 16:
-        raise ValueError("waveform must contain at least 16 samples.")
+    if waveform is None:
+        raise ValueError("waveform must not be None.")
     waveform = np.asarray(waveform, dtype=float)
+    if waveform.ndim != 1:
+        raise ValueError("waveform must be a 1D array.")
+    if len(waveform) < 16:
+        raise ValueError("waveform must contain at least 16 samples.")
     if not np.all(np.isfinite(waveform)):
         raise ValueError("waveform contains NaN or infinite values.")
     return waveform
 
 
-# ── PUBLIC SANITISATION HELPER ────────────────────────────────────────────────
+# ── DATA QUALITY SCORE ────────────────────────────────────────────────────────
+
+def _data_quality(waveform: np.ndarray) -> float:
+    """
+    Simple data quality score [0, 1].
+    Penalises very short windows and flat/clipped signals.
+    """
+    n    = len(waveform)
+    len_score = float(np.clip((n - 16) / (512 - 16), 0.0, 1.0))
+    rng  = float(np.ptp(waveform))
+    rng_score = float(np.clip(rng / (np.std(waveform) * 4 + 1e-9), 0.0, 1.0))
+    return 0.6 * len_score + 0.4 * rng_score
+
+
+# ── PUBLIC SANITISATION ───────────────────────────────────────────────────────
 
 def sanitize_channel_for_api(ch_key: str, ch_val: ChannelResult) -> dict:
-    """
-    Public helper — returns only whitelisted metadata keys.
-    Used by both /analyse and /validate to ensure consistent sanitisation.
-    Internal values (kappa_raw, p_value, z_score, band_energies, b_value
-    raw, stub flags) are never included.
-    """
     safe_meta = {k: v for k, v in ch_val.metadata.items()
                  if k in _PUBLIC_METADATA_KEYS}
     return {
@@ -379,41 +337,97 @@ def sanitize_channel_for_api(ch_key: str, ch_val: ChannelResult) -> dict:
     }
 
 
+# ── AUDIT HASH ────────────────────────────────────────────────────────────────
+
+def _audit_hash(cci: float, ts: float, run: int, domain: str) -> str:
+    payload = f"{BUILD_TAG}|{domain}|{cci:.6f}|{ts:.2f}|{run}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 # ── MAIN ENGINE ───────────────────────────────────────────────────────────────
 
 class TCEngine:
     """
-    Triple-Convergence Acoustic Diagnostic Engine v2.0
+    Triple-Convergence Acoustic Diagnostic Engine v3.0
 
-    Stateful per-instance: Kalman filter and Ljung-Box history accumulate
-    across calls to analyse(). For independent per-request scoring, create
-    a fresh TCEngine() per request (see FastAPI wrapper).
+    Five-channel CCI with domain-specific weights, persistence gate,
+    IAAFT surrogate rejection, and confidence scoring.
 
-    Black-box: channel weights, thresholds, and k-ratio methodology are
+    Stateful per-instance: Kalman, Ljung-Box, AttractorDrift, PLV, and
+    persistence gate all accumulate state across calls to analyse().
+
+    For independent per-request scoring (one-shot endpoints), create a
+    fresh TCEngine() per request.
+
+    For streaming sessions, retain the same instance across calls.
+
+    Black-box: channel weights, thresholds, and channel formulas are
     not accessible through any public interface.
     """
 
-    def __init__(self) -> None:
-        self._kalman    = _EigenKalman(dim=_KALMAN_DIM)
-        self._alb       = _AdaptiveLjungBox()
-        self._run_count = 0
+    def __init__(self, domain: str = "seismic", fs: float = 100.0,
+                 enable_surrogate_gate: bool = True) -> None:
+        self._domain_cfg         = get_domain_config(domain)
+        self._domain             = domain
+        self._kalman             = _EigenKalman(dim=_KALMAN_DIM)
+        self._alb                = _AdaptiveLjungBox()
+        self._attractor_drift    = AttractorDrift()
+        self._plv                = PLVChannel(fs=fs)
+        self._persistence        = PersistenceGate()
+        self._surrogate_gate     = SurrogateGate() if enable_surrogate_gate else None
+        self._enable_surrogate   = enable_surrogate_gate
+        self._run_count          = 0
+
+    def _compute_cci(self, channels: Dict[str, ChannelResult]) -> float:
+        weights = self._domain_cfg.weights
+        cci = sum(
+            w * (channels[k].normalised if k in channels else 0.0)
+            for k, w in weights.items()
+        )
+        return float(np.clip(cci, 0.0, 1.0))
+
+    def _cci_to_raw_level(self, cci: float) -> str:
+        if cci >= THRESHOLD_CRITICAL: return "CRITICAL"
+        if cci >= THRESHOLD_WARNING:  return "WARNING"
+        if cci >= THRESHOLD_ADVISORY: return "ADVISORY"
+        return "NOMINAL"
+
+    def _surrogate_engine_fn(self, waveform: np.ndarray, domain: str) -> float:
+        """
+        Lightweight CCI-only pass for surrogate gate — no state updates.
+
+        Cold-start limitation: each surrogate is scored with a fresh engine
+        (no Kalman/AttractorDrift/PLV history), while the real engine may
+        have accumulated state across many windows. This means surrogate CCI
+        is not a perfectly matched null — it is slightly conservative (lower
+        surrogate CCI → easier to pass the gate).
+
+        Acceptable for one-shot screening. For streaming session validation,
+        a stateless CCI path or channel-state snapshot/clone is required to
+        produce apples-to-apples surrogate comparison.
+
+        TODO (streaming): implement channel state snapshot so surrogate
+        engines are initialised with matching Kalman/LB/drift history.
+        """
+        eng = TCEngine(domain=domain, enable_surrogate_gate=False)
+        out = eng.analyse(waveform, apply_surrogate_gate=False)
+        return out.cci
 
     def analyse(
         self,
-        waveform:   np.ndarray,
-        magnitudes: Optional[np.ndarray] = None,
-        mc:         float = 0.0,
-        timestamp:  Optional[float] = None,
+        waveform:              np.ndarray,
+        magnitudes:            Optional[np.ndarray] = None,
+        mc:                    float = 0.0,
+        timestamp:             Optional[float] = None,
+        apply_surrogate_gate:  bool = True,
     ) -> EngineOutput:
-        # Fix: correct None-safe timestamp — avoids falsy 0.0 edge case
         ts = time.time() if timestamp is None else timestamp
 
         waveform = _validate_waveform(waveform)
         self._run_count += 1
 
         # DWT: internal conditioning — band_energies never leave analyse()
-        band_e, _migration = _compute_dwt_internal(waveform)
-
+        band_e, _mig = _dwt_energy_profile(waveform)
         rms = float(np.sqrt(np.mean(waveform ** 2)))
         obs = np.array([
             band_e[0] if len(band_e) > 0 else 0.0,
@@ -422,61 +436,124 @@ class TCEngine:
             rms,
         ])
 
-        kalman_result = _compute_kalman_channel(obs, self._kalman)
-        lb_result     = _compute_lb_channel(waveform, self._alb)
+        # ── channel computation ───────────────────────────────────────────────
+        kalman_result   = _compute_kalman_channel(obs, self._kalman)
+        lb_result       = _compute_lb_channel(waveform, self._alb)
 
         if magnitudes is None:
             magnitudes = _synthesise_magnitudes(waveform)
         else:
             magnitudes = np.asarray(magnitudes, dtype=float)
             if len(magnitudes) < 5:
-                raise ValueError('magnitudes must contain at least 5 values if provided.')
+                raise ValueError("magnitudes must contain at least 5 values.")
             if not np.all(np.isfinite(magnitudes)):
-                raise ValueError('magnitudes contains NaN or infinite values.')
-        b_result = _compute_b_value_channel(magnitudes, mc)
-        k_result = _compute_k_ratio_channel(waveform)
+                raise ValueError("magnitudes contains NaN or infinite values.")
 
-        # Four public channels only — DWT is internal
+        b_result        = _compute_b_value_channel(magnitudes, mc)
+
+        drift_score     = self._attractor_drift.update(waveform)
+        drift_result    = ChannelResult(
+            normalised=drift_score,
+            label="Geometric instability",
+            metadata={},
+        )
+
+        plv_score, plv_rising = self._plv.update(waveform)
+        plv_result      = ChannelResult(
+            normalised=plv_score,
+            label="Phase coupling index",
+            metadata={"rising": plv_rising},
+        )
+
         channels = {
-            "b_value":   b_result,
-            "kappa":     kalman_result,
-            "k_ratio":   k_result,
-            "ljung_box": lb_result,
+            "b_value":         b_result,
+            "kappa":           kalman_result,
+            "attractor_drift": drift_result,
+            "plv":             plv_result,
+            "ljung_box":       lb_result,
         }
 
-        cci         = _compute_cci(channels)
-        alert_level = _cci_to_alert(cci)
+        # ── CCI and persistence gate ──────────────────────────────────────────
+        cci         = self._compute_cci(channels)
+        raw_level   = self._cci_to_raw_level(cci)
+        gated_level, _, persistence_score = self._persistence.update(cci)
+
+        # ── surrogate gate ────────────────────────────────────────────────────
+        surrogate_z      = 0.0
+        surrogate_tested = False
+
+        if (self._enable_surrogate and apply_surrogate_gate
+                and gated_level in ("WARNING", "CRITICAL")):
+            z_min    = SURROGATE_Z_MIN.get(gated_level, 2.0)
+            passes, surrogate_z, _s_mean = self._surrogate_gate.test(
+                waveform=waveform,
+                real_cci=cci,
+                engine_fn=self._surrogate_engine_fn,
+                domain=self._domain,
+                z_min=z_min,
+            )
+            surrogate_tested = True
+            if not passes:
+                # Downgrade — real CCI indistinguishable from linear surrogate
+                gated_level = "ADVISORY" if gated_level == "WARNING" else "WARNING"
+
+        # ── confidence score ──────────────────────────────────────────────────
+        dq = _data_quality(waveform)
+        if surrogate_tested:
+            s_score = float(np.clip(surrogate_z / 3.0, 0.0, 1.0))
+        else:
+            s_score = 0.5  # neutral when not yet tested
+
+        # Softened multiplicative confidence — early windows (low persistence)
+        # are not destroyed; all three factors must be strong for high confidence.
+        confidence = float(np.clip(
+            (0.5 + 0.5 * persistence_score) *
+            (0.5 + 0.5 * s_score) *
+            dq,
+            0.0, 1.0
+        ))
+
+        # Enforce confidence floor — alert suppressed if confidence too low
+        floor = CONFIDENCE_FLOOR.get(gated_level, 0.0)
+        if confidence < floor and gated_level != "NOMINAL":
+            gated_level = "ADVISORY" if gated_level in ("WARNING", "CRITICAL") else "NOMINAL"
 
         return EngineOutput(
             timestamp=ts,
             cci=cci,
-            alert_level=alert_level,
+            alert_level=gated_level,
+            raw_alert_level=raw_level,
+            domain=self._domain,
             channels=channels,
-            audit_hash=_audit_hash(cci, ts, self._run_count),
+            audit_hash=_audit_hash(cci, ts, self._run_count, self._domain),
             sample_count=len(waveform),
+            persistence_score=round(persistence_score, 4),
+            confidence=round(confidence, 4),
+            surrogate_z=round(surrogate_z, 4),
+            surrogate_tested=surrogate_tested,
         )
 
 
 # ── VALIDATION HARNESS ────────────────────────────────────────────────────────
 
-_VALIDATION_EVENTS: Dict[str, dict] = {
+_VALIDATION_EVENTS: Dict = {
     "Tohoku_2011": {
         "description":    "Mw 9.1 megathrust — offshore Honshu, Japan",
-        "domain":         "Seismic",
+        "domain":         "seismic",
         "onset_frac":     0.12,
         "severity_scale": 0.89,
         "seed":           2011,
     },
     "Eyjafjallajokull_2010": {
         "description":    "VEI 4 sub-glacial eruption — Iceland",
-        "domain":         "Volcanic",
+        "domain":         "volcanic",
         "onset_frac":     0.18,
         "severity_scale": 0.81,
         "seed":           2010,
     },
     "Rana_Plaza_2013": {
         "description":    "Structural progressive collapse — Dhaka, Bangladesh",
-        "domain":         "Structural AE",
+        "domain":         "structural",
         "onset_frac":     0.22,
         "severity_scale": 0.76,
         "seed":           2013,
@@ -486,35 +563,59 @@ _VALIDATION_EVENTS: Dict[str, dict] = {
 
 def _make_precursor_signal(n: int, onset_frac: float,
                             severity_scale: float, seed: int) -> np.ndarray:
-    rng    = np.random.default_rng(seed)
-    t      = np.linspace(0, 4 * np.pi, n)
-    sig    = rng.normal(0, 0.1, n)
-    onset  = int(n * onset_frac)
-    sf     = 0.3 + (1 - severity_scale) * 0.5
-    ramp   = np.linspace(0, severity_scale * 2, n - onset)
+    rng   = np.random.default_rng(seed)
+    t     = np.linspace(0, 4 * np.pi, n)
+    sig   = rng.normal(0, 0.1, n)
+    onset = int(n * onset_frac)
+    sf    = 0.3 + (1 - severity_scale) * 0.5
+    ramp  = np.linspace(0, severity_scale * 2, n - onset)
     sig[onset:] += ramp * np.sin(sf * t[onset:])
-    burst  = int(n * 0.85)
+    burst = int(n * 0.85)
     sig[burst:] += rng.normal(0, severity_scale * 1.5, n - burst)
     return sig
 
 
+def _make_white_noise_negative_control(n: int, seed: int) -> np.ndarray:
+    """
+    Pure white noise negative control.
+    Used to establish a noise-floor CCI baseline in the validation harness.
+    This is NOT an IAAFT phase-randomized surrogate — it does not preserve
+    the power spectrum or amplitude distribution of the real signal.
+    True IAAFT surrogate baseline is implemented in surrogate.py and is
+    used by the live surrogate rejection gate in TCEngine.analyse().
+    """
+    return np.random.default_rng(seed + 9999).normal(0, 0.1, n)
+
+
 def run_validation(n_samples: int = 512) -> Dict:
     """
-    Run the synthetic historical event harness.
+    Run the synthetic historical event harness — v3.0.
 
-    Each event uses a fresh TCEngine instance to prevent cross-contamination
-    of Kalman and Ljung-Box state between events.
+    Each event uses:
+      - Fresh TCEngine per domain (no state contamination)
+      - Surrogate gate DISABLED during harness (gate would consume
+        significant time and is tested separately)
+      - White-noise surrogate run per event for z-score baseline
+      - Peak CCI across windowed analysis reported
+      - First WARNING window index reported (lead-time proxy)
 
-    Reports peak CCI across the windowed analysis — the highest alert
-    reached before the event, not the final window state.
+    Returns expanded schema per event:
+      event_name, domain, description, cci_peak, alert_level,
+      raw_alert_level, first_warning_window, lead_time_windows,
+      surrogate_mean_cci, surrogate_std_cci, z_score_vs_surrogate,
+      persistence_score, confidence, status, audit_hash, channels
 
-    Internal fields (severity_scale, seed, band_energies, raw channel
-    values) are never included in the returned dict.
+    Status codes:
+      SIM-HARNESS-PASS  — peak CCI ≥ 90% of severity_scale threshold
+      SIM-HARNESS-FAIL  — peak CCI below threshold
     """
     results: Dict = {}
+    window_size   = 128
+    step          = 32
 
     for event_id, cfg in _VALIDATION_EVENTS.items():
-        engine   = TCEngine()   # fresh per event — no state contamination
+        domain  = cfg["domain"]
+        engine  = TCEngine(domain=domain, enable_surrogate_gate=False)
         waveform = _make_precursor_signal(
             n=n_samples,
             onset_frac=cfg["onset_frac"],
@@ -522,30 +623,82 @@ def run_validation(n_samples: int = 512) -> Dict:
             seed=cfg["seed"],
         )
 
-        window_size = 128
-        step        = 32
-        peak_out    = None
-        peak_cci    = -1.0
-        window_idx  = 0
+        peak_out             = None
+        peak_cci             = -1.0
+        first_warning_window = None
+        window_idx           = 0
 
         for i, start in enumerate(range(0, n_samples - window_size + 1, step)):
-            out = engine.analyse(waveform=waveform[start: start + window_size])
+            out = engine.analyse(
+                waveform=waveform[start: start + window_size],
+                apply_surrogate_gate=False,
+            )
             if out.cci > peak_cci:
                 peak_cci   = out.cci
                 peak_out   = out
-                window_idx = i
+            if first_warning_window is None and out.raw_alert_level in ("WARNING", "CRITICAL"):
+                first_warning_window = i
+            window_idx = i
 
-        out    = peak_out
-        status = "SIM-HARNESS-PASS" if out.cci >= cfg["severity_scale"] * 0.90 else "SIM-HARNESS-FAIL"
+        # White-noise negative control baseline (NOT IAAFT — see docstring above)
+        n_surr = 9
+        surrogate_ccis = []
+        for si in range(n_surr):
+            s_eng  = TCEngine(domain=domain, enable_surrogate_gate=False)
+            noise  = _make_white_noise_negative_control(n_samples, seed=cfg["seed"] + si)
+            s_peak = -1.0
+            for start in range(0, n_samples - window_size + 1, step):
+                s_out = s_eng.analyse(
+                    waveform=noise[start: start + window_size],
+                    apply_surrogate_gate=False,
+                )
+                if s_out.cci > s_peak:
+                    s_peak = s_out.cci
+            surrogate_ccis.append(s_peak)
+
+        s_arr           = np.array(surrogate_ccis)
+        surrogate_mean  = float(s_arr.mean())
+        surrogate_std   = float(s_arr.std() + 1e-9)
+        z_score         = (peak_cci - surrogate_mean) / surrogate_std
+
+        out     = peak_out
+        status  = (
+            "SIM-HARNESS-PASS"
+            if out.cci >= cfg["severity_scale"] * 0.90
+            else "SIM-HARNESS-FAIL"
+        )
+
+        total_windows        = window_idx + 1
+        lead_time_windows    = (
+            (total_windows - first_warning_window)
+            if first_warning_window is not None else 0
+        )
 
         results[event_id] = {
-            "description":      cfg["description"],
-            "domain":           cfg["domain"],
-            "synthetic_profile": "synthetic precursor profile",
-            "cci_achieved":     round(out.cci, 4),
-            "alert_level":      out.alert_level,
-            "status":           status,
-            "audit_hash":       out.audit_hash,
+            "description":              cfg["description"],
+            "domain":                   domain,
+            "cci_peak":                 round(out.cci, 4),
+            "alert_level":              out.alert_level,
+            "raw_alert_level":          out.raw_alert_level,
+            "first_warning_window":     first_warning_window,
+            "lead_time_windows":        lead_time_windows,
+            "total_windows":            total_windows,
+            "noise_floor_mean_cci":     round(surrogate_mean, 4),
+            "noise_floor_std_cci":      round(surrogate_std, 4),
+            "z_score_vs_noise_floor":   round(z_score, 4),
+            "noise_floor_note":         (
+                "Baseline is white-noise negative control, not IAAFT surrogate. "
+                "IAAFT phase-randomized surrogate gate is active in live engine."
+            ),
+            "persistence_score":        round(out.persistence_score, 4),
+            "confidence":               round(out.confidence, 4),
+            "status":                   status,
+            "audit_hash":               out.audit_hash,
+            "disclaimer": (
+                "IRIS/FDSN retrospective validation is pending under "
+                "TC-VAL-PROTO-001. SIM-HARNESS-PASS does not constitute "
+                "empirical instrument-data validation."
+            ),
             "channels": {
                 k: sanitize_channel_for_api(k, v)
                 for k, v in out.channels.items()
@@ -553,4 +706,3 @@ def run_validation(n_samples: int = 512) -> Dict:
         }
 
     return results
-
