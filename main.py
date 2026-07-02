@@ -750,4 +750,3 @@ def trial_csv(domain: str, request: Request,
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return _build_response(out, mode="screening")
-
