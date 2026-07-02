@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRECEPT Scout — Risk Command Portal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:#080B0F; --panel:#0A1628; --border:#1A2F50;
+    --cyan:#00D4FF; --cyan-dim:#0088AA; --green:#00FF88;
+    --amber:#FF8C00; --red:#FF3333; --gold:#FFD700; --purple:#8B5CF6;
+    --text:#C8D8E8; --text-dim:#4A6080;
+    --mono:'JetBrains Mono',monospace; --sans:'Inter',sans-serif;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); font-size:13px; min-height:100vh; }
+  a { color:var(--cyan); text-decoration:none; }
+
+  /* GATE */
+  #gate { position:fixed; inset:0; background:rgba(8,11,15,0.97); display:flex; align-items:center; justify-content:center; z-index:1000; }
+  .gate-box { background:var(--panel); border:1px solid var(--border); padding:40px 48px; width:460px; text-align:center; }
+  .gate-logo { font-family:var(--mono); font-size:11px; letter-spacing:0.3em; color:var(--cyan); text-transform:uppercase; margin-bottom:8px; }
+  .gate-title { font-family:var(--mono); font-size:20px; font-weight:700; color:#fff; margin-bottom:6px; }
+  .gate-sub { color:var(--text-dim); font-size:12px; margin-bottom:32px; line-height:1.6; }
+  .gate-input { width:100%; background:var(--bg); border:1px solid var(--border); color:var(--cyan); font-family:var(--mono); font-size:14px; letter-spacing:0.1em; padding:12px 14px; outline:none; margin-bottom:14px; text-transform:uppercase; }
+  .gate-input:focus { border-color:var(--cyan); }
+  .gate-btn { width:100%; background:var(--cyan); color:var(--bg); border:none; font-family:var(--mono); font-size:12px; font-weight:700; letter-spacing:0.15em; padding:13px; cursor:pointer; text-transform:uppercase; }
+  .gate-btn:hover { opacity:0.85; }
+  .gate-error { color:var(--red); font-family:var(--mono); font-size:11px; margin-top:10px; min-height:16px; }
+  .gate-footer { margin-top:24px; color:var(--text-dim); font-family:var(--mono); font-size:9px; line-height:1.8; }
+
+  /* HEADER */
+  header { background:var(--panel); border-bottom:1px solid var(--border); padding:0 20px; height:52px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:50; }
+  .brand { font-family:var(--mono); font-size:14px; font-weight:700; color:#fff; letter-spacing:0.06em; }
+  .brand span { color:var(--cyan); }
+  .brand-sub { font-family:var(--mono); font-size:8px; letter-spacing:0.15em; color:var(--text-dim); text-transform:uppercase; margin-top:2px; }
+  .nav { display:flex; gap:4px; }
+  .nav-btn { font-family:var(--mono); font-size:10px; letter-spacing:0.1em; color:var(--text-dim); background:none; border:1px solid transparent; padding:8px 14px; cursor:pointer; text-transform:uppercase; }
+  .nav-btn:hover { color:var(--text); }
+  .nav-btn.active { color:var(--cyan); border-color:var(--cyan-dim); background:rgba(0,212,255,0.06); }
+  .header-right { display:flex; align-items:center; gap:12px; font-family:var(--mono); font-size:9px; color:var(--text-dim); }
+  .live-dot { width:6px; height:6px; border-radius:50%; background:var(--green); display:inline-block; margin-right:6px; animation:pulse-dot 2s infinite; }
+  .live-dot.offline { background:var(--red); animation:none; }
+  @keyframes pulse-dot { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+
+  .view { display:none; max-width:1000px; margin:0 auto; padding:28px 20px 80px; }
+  .view.active { display:block; }
+  .section-title { font-family:var(--mono); font-size:11px; letter-spacing:0.2em; color:var(--text-dim); text-transform:uppercase; margin:32px 0 14px; }
+  .section-title:first-child { margin-top:0; }
+
+  /* SUMMARY */
+  .summary-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  .summary-card { background:var(--panel); border:1px solid var(--border); padding:18px; }
+  .summary-icon { font-size:20px; margin-bottom:8px; }
+  .summary-domain { font-family:var(--mono); font-size:12px; font-weight:700; color:#fff; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px; }
+  .summary-count { font-family:var(--mono); font-size:10px; color:var(--text-dim); line-height:1.8; }
+  .summary-count b { color:var(--text); }
+
+  /* ALERTS */
+  .alert-item { display:flex; align-items:center; gap:12px; padding:11px 0; border-bottom:1px solid rgba(26,47,80,0.5); cursor:pointer; transition:background 0.1s; }
+  .alert-item:hover { background:rgba(0,212,255,0.03); }
+  .dot { width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+  .dot-nominal { background:var(--green); }
+  .dot-advisory { background:var(--gold); }
+  .dot-warning { background:var(--amber); }
+  .dot-critical { background:var(--red); animation:critical-pulse 1s infinite; }
+  @keyframes critical-pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+  .alert-name { font-family:var(--mono); font-size:11px; color:#fff; font-weight:600; }
+  .alert-detail { font-family:var(--mono); font-size:9px; color:var(--text-dim); margin-top:2px; }
+  .alert-level-tag { margin-left:auto; font-family:var(--mono); font-size:9px; letter-spacing:0.1em; padding:3px 10px; border:1px solid; text-transform:uppercase; flex-shrink:0; }
+  .tag-nominal  { color:var(--green); border-color:var(--green); }
+  .tag-advisory { color:var(--gold);  border-color:var(--gold); }
+  .tag-warning  { color:var(--amber); border-color:var(--amber); }
+  .tag-critical { color:var(--red);   border-color:var(--red); }
+
+  /* ASSET CARDS */
+  .asset-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .asset-card { background:var(--panel); border:1px solid var(--border); padding:16px; cursor:pointer; transition:border-color 0.15s; }
+  .asset-card:hover { border-color:var(--cyan-dim); }
+  .asset-card-top { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; }
+  .asset-name { font-family:var(--mono); font-size:12px; font-weight:700; color:#fff; }
+  .asset-rows { font-family:var(--mono); font-size:9px; color:var(--text-dim); line-height:2; }
+  .asset-rows b { color:var(--text); }
+  .asset-action { margin-top:10px; padding-top:10px; border-top:1px solid var(--border); font-family:var(--mono); font-size:9px; color:var(--cyan); }
+
+  /* MODAL */
+  #modal-overlay { display:none; position:fixed; inset:0; background:rgba(8,11,15,0.88); z-index:200; align-items:flex-start; justify-content:center; overflow-y:auto; padding:40px 16px; }
+  #modal-overlay.open { display:flex; }
+  .modal-box { background:var(--panel); border:1px solid var(--border); width:100%; max-width:580px; padding:28px; }
+  .modal-header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:18px; padding-bottom:16px; border-bottom:1px solid var(--border); }
+  .modal-title { font-family:var(--mono); font-size:15px; font-weight:700; color:#fff; }
+  .modal-close { background:none; border:1px solid var(--border); color:var(--text-dim); font-family:var(--mono); font-size:11px; padding:4px 10px; cursor:pointer; }
+  .evidence-row { display:flex; justify-content:space-between; align-items:center; padding:10px 0; border-bottom:1px solid rgba(26,47,80,0.5); font-family:var(--mono); font-size:11px; }
+  .evidence-label { color:var(--text-dim); }
+  .evidence-value { font-weight:600; }
+  .ev-stable    { color:var(--green); }
+  .ev-rising    { color:var(--gold); }
+  .ev-elevated  { color:var(--amber); }
+  .ev-abnormal  { color:var(--red); }
+  .ev-confirmed { color:var(--amber); }
+  .ev-passed    { color:var(--green); }
+  .ev-pending   { color:var(--text-dim); }
+  .recommend-box { background:rgba(255,140,0,0.06); border:1px solid rgba(255,140,0,0.2); padding:12px 14px; margin-top:16px; font-family:var(--mono); font-size:10px; line-height:1.6; }
+  .recommend-head { color:var(--amber); font-size:9px; letter-spacing:0.15em; text-transform:uppercase; margin-bottom:6px; }
+  .modal-btns { display:flex; gap:10px; margin-top:16px; }
+  .modal-btn { flex:1; font-family:var(--mono); font-size:10px; font-weight:600; letter-spacing:0.1em; padding:11px; cursor:pointer; text-transform:uppercase; border:1px solid var(--cyan-dim); background:none; color:var(--cyan); }
+  .modal-btn:hover { background:rgba(0,212,255,0.08); }
+  .modal-btn:disabled { color:var(--text-dim); border-color:var(--border); cursor:not-allowed; }
+
+  /* CTA */
+  .cta-box { background:rgba(0,212,255,0.05); border:1px solid var(--cyan-dim); padding:20px 24px; margin-top:28px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .cta-text { font-family:var(--mono); font-size:11px; color:var(--text); line-height:1.6; }
+  .cta-text b { color:var(--cyan); }
+  .cta-btn { font-family:var(--mono); font-size:10px; font-weight:700; letter-spacing:0.15em; padding:12px 20px; background:var(--cyan); color:var(--bg); border:none; cursor:pointer; text-transform:uppercase; white-space:nowrap; }
+  .cta-btn:hover { opacity:0.85; }
+
+  /* VALIDATION */
+  .val-intro { color:var(--text-dim); font-size:12px; line-height:1.7; margin-bottom:20px; }
+  .val-btn { background:var(--cyan); color:var(--bg); border:none; font-family:var(--mono); font-size:11px; font-weight:700; letter-spacing:0.15em; padding:13px 28px; cursor:pointer; text-transform:uppercase; }
+  .val-btn:disabled { background:var(--border); color:var(--text-dim); cursor:not-allowed; }
+  .val-event { background:var(--panel); border:1px solid var(--border); padding:18px 20px; margin-top:14px; }
+  .val-event-name { font-family:var(--mono); font-size:13px; font-weight:700; color:#fff; margin-bottom:4px; }
+  .val-event-desc { font-family:var(--mono); font-size:10px; color:var(--text-dim); margin-bottom:12px; }
+  .val-status { display:inline-block; font-family:var(--mono); font-size:9px; font-weight:700; letter-spacing:0.15em; padding:4px 10px; border:1px solid; text-transform:uppercase; margin-bottom:10px; }
+  .val-pass { color:var(--green); border-color:var(--green); }
+  .val-fail { color:var(--red);   border-color:var(--red); }
+  .val-headline { font-size:13px; color:#fff; line-height:1.6; margin:10px 0; }
+  .val-meta { font-family:var(--mono); font-size:9px; color:var(--text-dim); line-height:1.8; }
+  .val-disclaimer { font-family:var(--mono); font-size:9px; color:var(--text-dim); line-height:1.8; margin-top:20px; padding:14px 16px; border:1px solid var(--border); }
+
+  /* API */
+  .api-block { background:var(--panel); border:1px solid var(--border); padding:18px 20px; margin-bottom:16px; }
+  .api-block h3 { font-family:var(--mono); font-size:11px; color:var(--cyan); letter-spacing:0.1em; text-transform:uppercase; margin-bottom:10px; }
+  .api-note { font-family:var(--mono); font-size:10px; color:var(--text-dim); line-height:1.7; margin-top:8px; }
+  .api-endpoint { font-family:var(--mono); font-size:11px; color:#fff; padding:5px 0; }
+  .api-endpoint .method { color:var(--green); font-weight:700; margin-right:8px; }
+  .api-endpoint .note { color:var(--text-dim); font-size:9px; margin-left:8px; }
+  pre { background:var(--bg); border:1px solid var(--border); padding:14px; font-family:var(--mono); font-size:10px; color:var(--text); overflow-x:auto; line-height:1.6; margin-top:8px; }
+  .copy-btn { font-family:var(--mono); font-size:9px; color:var(--cyan); background:none; border:1px solid var(--cyan-dim); padding:4px 10px; cursor:pointer; margin-top:6px; }
+  .copy-btn:hover { background:rgba(0,212,255,0.08); }
+  .secret-note { font-family:var(--mono); font-size:9px; color:var(--text-dim); border-left:2px solid var(--cyan-dim); padding-left:10px; margin-top:10px; line-height:1.7; }
+
+  /* SPINNER */
+  .spinner { display:inline-block; width:10px; height:10px; border:2px solid var(--text-dim); border-top-color:var(--cyan); border-radius:50%; animation:spin 0.7s linear infinite; vertical-align:middle; margin-right:6px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* PRINT */
+  @media print {
+    header, .nav, #modal-overlay, #gate, .cta-box, .val-btn, .modal-btns { display:none !important; }
+    body { background:#fff; color:#000; }
+    .view { display:block !important; }
+  }
+
+  @media (max-width:700px) {
+    .summary-grid, .asset-grid { grid-template-columns:1fr; }
+    .nav-btn { padding:8px 9px; font-size:9px; }
+    .cta-box { flex-direction:column; }
+  }
+</style>
+</head>
+<body>
+
+<!-- GATE -->
+<div id="gate">
+  <div class="gate-box">
+    <div class="gate-logo">AW IP Holdings Inc.</div>
+    <div class="gate-title">PRECEPT Scout</div>
+    <div class="gate-sub">Multi-Hazard Precursor Intelligence<br>Earthquake · Volcano · Infrastructure</div>
+    <input class="gate-input" id="gate-input" type="text" placeholder="ACCESS CODE" autocomplete="off" spellcheck="false">
+    <button class="gate-btn" onclick="checkGate()">Enter Command Portal</button>
+    <div class="gate-error" id="gate-error"></div>
+    <div class="gate-footer">
+      PRECEPT Scout · Evaluation License<br>
+      Engine: TC-ENGINE-2025-V3-PROD<br>
+      © 2025 AW IP Holdings Inc. All rights reserved.
+    </div>
+  </div>
+</div>
+
+<header>
+  <div>
+    <div class="brand"><span>PRECEPT</span> SCOUT</div>
+    <div class="brand-sub">Multi-Hazard Precursor Intelligence · Earthquake · Volcano · Infrastructure</div>
+  </div>
+  <div class="nav">
+    <button class="nav-btn active" data-view="dashboard" onclick="switchView('dashboard')">Dashboard</button>
+    <button class="nav-btn" data-view="validation" onclick="switchView('validation')">Verification Harness</button>
+    <button class="nav-btn" data-view="api" onclick="switchView('api')">API Access</button>
+  </div>
+  <div class="header-right">
+    <span><span class="live-dot" id="live-dot"></span><span id="live-text">CHECKING...</span></span>
+  </div>
+</header>
+
+<!-- DASHBOARD -->
+<div class="view active" id="view-dashboard">
+  <div class="section-title">Operational Status</div>
+  <div class="api-block" style="margin-bottom:20px;">
+    <h3>Live Engine Connected</h3>
+    <div class="api-note">
+      This portal is connected to the active PRECEPT engine API. Public access uses synthetic
+      precursor profiles only. Customer validation requires approved waveform datasets and a
+      trial code. Channel weights, thresholds, and internal formulas are never exposed.
+    </div>
+  </div>
+
+  <div class="section-title">Risk Summary</div>
+  <div class="summary-grid" id="summary-grid">
+    <div class="summary-card"><div class="summary-icon">⏳</div><div class="summary-domain">Loading engine...</div></div>
+  </div>
+
+  <div class="section-title">Recent Alerts</div>
+  <div id="alerts-list"></div>
+
+  <div class="section-title">Monitored Assets</div>
+  <div class="asset-grid" id="asset-grid"></div>
+
+  <div class="cta-box">
+    <div class="cta-text">
+      <b>Ready to connect your data?</b><br>
+      Production API access, live sensor ingestion, and custom domain deployment are available under a commercial license.
+    </div>
+    <button class="cta-btn" onclick="switchView('api');document.getElementById('view-api').scrollIntoView()">Request Production Access</button>
+  </div>
+</div>
+
+<!-- VALIDATION -->
+<div class="view" id="view-validation">
+  <div class="section-title">Verification Harness</div>
+  <div class="val-intro">
+    Run the engine against controlled synthetic precursor profiles modeled on documented
+    characteristics of three major historical events, plus a white-noise negative control.
+    These are live harness outputs generated from controlled precursor profiles. Operational claims require validation against customer-approved instrument datasets. Every result is generated on request through the live engine — no static result table.
+  </div>
+  <button class="val-btn" id="val-run-btn" onclick="runValidation()">▶ Run Verification Harness</button>
+  <div id="val-results"></div>
+
+  <div class="cta-box" style="margin-top:32px;">
+    <div class="cta-text">
+      <b>Want independent validation against your own instrument data?</b><br>
+      Production access includes retrospective validation against client-supplied datasets.
+    </div>
+    <button class="cta-btn" onclick="location.href='mailto:info@awipholdings.com?subject=PRECEPT%20Production%20Access'">Contact AW IP Holdings</button>
+  </div>
+</div>
+
+<!-- API -->
+<div class="view" id="view-api">
+  <div class="section-title">API Access</div>
+
+  <div class="api-block">
+    <h3>Demo Endpoints (no key required)</h3>
+    <div class="api-endpoint"><span class="method">POST</span>/demo/session/create <span class="note">— start a demo engine session</span></div>
+    <div class="api-endpoint"><span class="method">POST</span>/demo/session/{id}/scan <span class="note">— advance one synthetic window</span></div>
+    <div class="api-endpoint"><span class="method">POST</span>/demo/validate/all <span class="note">— run full verification harness (public)</span></div>
+    <div class="api-endpoint"><span class="method">GET</span>/status <span class="note">— engine health check</span></div>
+    <div class="api-note">Demo endpoints are rate-limited. Synthetic waveforms only — no real data ingestion.</div>
+  </div>
+
+  <div class="api-block">
+    <h3>Trial Endpoints (trial code required)</h3>
+    <div class="api-endpoint"><span class="method">POST</span>/trial/session/create</div>
+    <div class="api-endpoint"><span class="method">POST</span>/trial/session/{id}/push</div>
+    <div class="api-endpoint"><span class="method">GET</span>/trial/session/{id}/status</div>
+    <div class="api-endpoint"><span class="method">DELETE</span>/trial/session/{id}</div>
+    <div class="api-endpoint"><span class="method">POST</span>/trial/csv/{domain}</div>
+    <div class="api-note">Trial endpoints accept real waveform data. Contact AW IP Holdings Inc. for a trial code.</div>
+  </div>
+
+  <div class="api-block">
+    <h3>Sample — Create Trial Session</h3>
+    <pre id="sample-req">curl -X POST https://tc-domain-api.onrender.com/trial/session/create \
+  -H "Content-Type: application/json" \
+  -d '{"domain":"seismic","trial_code":"YOUR-TRIAL-CODE","fs":100}'</pre>
+    <button class="copy-btn" onclick="copyBlock('sample-req')">Copy</button>
+  </div>
+
+  <div class="api-block">
+    <h3>Sample — Push Waveform Window</h3>
+    <pre id="sample-push">curl -X POST https://tc-domain-api.onrender.com/trial/session/{session_id}/push \
+  -H "Content-Type: application/json" \
+  -d '{
+    "trial_code": "YOUR-TRIAL-CODE",
+    "waveform": [0.012, -0.034, 0.051, -0.008, 0.022, ...],
+    "mc": 0.0
+  }'</pre>
+    <button class="copy-btn" onclick="copyBlock('sample-push')">Copy</button>
+    <div class="api-note">Waveform must be normalized to [-1, 1]. Minimum 16 samples, maximum 20,000.</div>
+  </div>
+
+  <div class="api-block">
+    <h3>Sample Response</h3>
+    <pre>{
+  "domain": "seismic",
+  "cci": 0.7421,
+  "alert_level": "ADVISORY",
+  "raw_alert_level": "ADVISORY",
+  "persistence_score": 0.6,
+  "confidence": 0.71,
+  "surrogate_z": 0.0,
+  "surrogate_tested": false,
+  "channels": {
+    "b_value":        { "score": 0.68, "label": "Stress index" },
+    "kappa":          { "score": 0.55, "label": "Kalman covariance geometry" },
+    "attractor_drift":{ "score": 0.71, "label": "Geometric instability" },
+    "plv":            { "score": 0.49, "label": "Phase coupling index" },
+    "ljung_box":      { "score": 0.60, "label": "Temporal clustering index" }
+  },
+  "audit_hash": "a1b2c3d4...",
+  "sample_count": 128,
+  "engine_build": "TC-ENGINE-2025-V3-PROD"
+}</pre>
+    <div class="secret-note">
+      Channel weights, thresholds, and internal formulas are not exposed in any response.<br>
+      Engine internals are protected trade secrets of AW IP Holdings Inc.
+    </div>
+  </div>
+
+  <div class="cta-box">
+    <div class="cta-text">
+      <b>Ready for production?</b><br>
+      Full API key provisioning, webhook delivery, and SLA support available under commercial license.
+    </div>
+    <button class="cta-btn" onclick="location.href='mailto:info@awipholdings.com?subject=PRECEPT%20Production%20API%20Access'">Request Production Access</button>
+  </div>
+</div>
+
+<!-- EVIDENCE MODAL -->
+<div id="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title" id="modal-name">—</div>
+        <div style="font-family:var(--mono);font-size:9px;color:var(--text-dim);margin-top:4px;" id="modal-sub">—</div>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕ CLOSE</button>
+    </div>
+    <div id="modal-evidence"></div>
+    <div class="recommend-box">
+      <div class="recommend-head">Recommended Action</div>
+      <div id="modal-action" style="font-size:11px;color:var(--text);line-height:1.6;">—</div>
+    </div>
+    <div class="modal-btns">
+      <button class="modal-btn" id="modal-rescan" onclick="rescanCurrentAsset()">↻ Re-scan</button>
+      <button class="modal-btn" onclick="printReport()">⬇ Generate Report</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = 'https://tc-domain-api.onrender.com';
+// ── ACCESS GATE (cosmetic — client-side only) ────────────────────────────
+// These codes control UI visibility for showroom demos only.
+// They are intentionally visible in source. For real buyer access,
+// replace with a server-side trial code check (see /trial/* endpoints
+// and the PRECEPT_TRIAL_CODE env var on Render — that is the real gate).
+const VALID_CODES = ['PRECEPT-SCOUT','PRECEPT30','AWIP-DEMO'];
+
+const ASSETS = {
+  seismic: [
+    { key:'FAULT-CASCADE-01', name:'San Andreas Segment A' },
+    { key:'FAULT-PACIFIC-07', name:'Cascadia Subduction Zone' },
+    { key:'NETWORK-ARRAY-B',  name:'Mount Rainier Array' },
+  ],
+  volcanic: [
+    { key:'VOLCANO-ALPHA-01', name:'Volcano Alpha' },
+    { key:'TREMOR-ARRAY-03',  name:'Tremor Array 03' },
+    { key:'VENT-MONITOR-07',  name:'Vent Monitor 07' },
+  ],
+  structural: [
+    { key:'BRIDGE-HWY401-N',  name:'Bridge 24 / Pier B' },
+    { key:'DAM-NIAGARA-S',    name:'Dam 7' },
+    { key:'TUNNEL-BORE-12',   name:'Tunnel Bore 12' },
+  ],
+};
+const DOMAIN_ICON  = { seismic:'🌍', volcanic:'🌋', structural:'🏗️' };
+const DOMAIN_LABEL = { seismic:'Earthquakes', volcanic:'Volcanoes', structural:'Infrastructure' };
+const RANK = { NOMINAL:0, ADVISORY:1, WARNING:2, CRITICAL:3 };
+let state = {};
+let currentModalAsset = null;
+
+// ── SAFE SCORE GETTER ─────────────────────────────────────────────────────
+const getScore = (obj, fallback=0) => obj && typeof obj.score === 'number' ? obj.score : fallback;
+const getMeta  = (obj) => (obj && obj.metadata) ? obj.metadata : {};
+
+// ── GATE ──────────────────────────────────────────────────────────────────
+function checkGate() {
+  const val = document.getElementById('gate-input').value.trim().toUpperCase();
+  if (VALID_CODES.includes(val)) {
+    document.getElementById('gate').style.display = 'none';
+    checkEngineStatus();
+    initDashboard();
+  } else {
+    document.getElementById('gate-error').textContent = 'INVALID ACCESS CODE — CONTACT AW IP HOLDINGS INC.';
+  }
+}
+document.getElementById('gate-input').addEventListener('keydown', e => { if (e.key==='Enter') checkGate(); });
+
+async function checkEngineStatus() {
+  const dot  = document.getElementById('live-dot');
+  const text = document.getElementById('live-text');
+  try {
+    const res = await fetch(`${API_BASE}/status`);
+    if (!res.ok) throw 0;
+    dot.classList.remove('offline');
+    text.textContent = 'ENGINE LIVE';
+  } catch(e) {
+    dot.classList.add('offline');
+    text.textContent = 'ENGINE UNREACHABLE';
+  }
+}
+
+// ── NAV ───────────────────────────────────────────────────────────────────
+function switchView(name) {
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.view===name));
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-'+name).classList.add('active');
+}
+
+// ── QUALITATIVE LABELS (no raw scores exposed to UI) ─────────────────────
+function driftLabel(score)    { return score>=0.65?'rising':score>=0.40?'stable':'falling'; }
+function pressureLabel(score) { return score>=0.65?'elevated':'normal'; }
+function stressLabel(score)   { return score>=0.65?'abnormal':'normal'; }
+function couplingLabel(score) { return score>=0.65?'strengthening':score>=0.40?'stable':'weak'; }
+function clusterLabel(meta)   { return meta && meta.flagged?'detected':'none'; }
+function persistLabel(p)      { return p>=1.0?'confirmed':p>=0.5?'building':'accumulating'; }
+function surrogateLabel(tested, z) {
+  if (!tested) return 'not yet tested';
+  return z>=2.0?'passed':'marginal';
+}
+function trendLabel(prev, curr) {
+  if (prev==null) return 'establishing baseline';
+  const d = RANK[curr]-RANK[prev];
+  return d>0?'accelerating':d<0?'flattening':'stable';
+}
+function getAction(alert) {
+  return {
+    NOMINAL:  'Continue baseline monitoring. No operator action required.',
+    ADVISORY: 'Increase sampling frequency. Alert duty operator. Begin precautionary review.',
+    WARNING:  'Restrict access. Notify operations lead. Escalate to emergency protocol if trend continues.',
+    CRITICAL: 'Escalate immediately. Notify operations lead. Restrict zone access. Export alert and log to audit trail.',
+  }[alert] || 'Continue monitoring.';
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────────────────────
+async function initDashboard() {
+  for (const domain of Object.keys(ASSETS)) {
+    for (const a of ASSETS[domain]) {
+      await scanAsset(domain, a.key, true);
+    }
+  }
+  renderDashboard();
+}
+
+async function scanAsset(domain, assetKey, silent) {
+  const sk = domain+'|'+assetKey;
+  if (!state[sk]) state[sk] = { sessionId:null, lastResult:null, prevAlert:null, error:null };
+  const s = state[sk];
+  try {
+    if (!s.sessionId) {
+      const r = await fetch(`${API_BASE}/demo/session/create`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ domain, asset: assetKey }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail||'session error');
+      s.sessionId = d.session_id;
+    }
+    const r2 = await fetch(`${API_BASE}/demo/session/${s.sessionId}/scan`, { method:'POST' });
+    const d2  = await r2.json();
+    if (!r2.ok) throw new Error(d2.detail||'scan error');
+    s.prevAlert  = s.lastResult ? s.lastResult.alert_level : null;
+    s.lastResult = d2;
+    s.error      = null;
+  } catch(e) {
+    s.error = e.message;
+  }
+  if (!silent) renderDashboard();
+}
+
+function renderDashboard() {
+  // Summary cards
+  document.getElementById('summary-grid').innerHTML = Object.keys(ASSETS).map(domain => {
+    const results = ASSETS[domain].map(a => state[domain+'|'+a.key]?.lastResult).filter(Boolean);
+    const counts  = { NOMINAL:0, ADVISORY:0, WARNING:0, CRITICAL:0 };
+    results.forEach(r => counts[r.alert_level] = (counts[r.alert_level]||0)+1);
+    const flags = Object.entries(counts)
+      .filter(([k,v])=>v>0 && k!=='NOMINAL')
+      .map(([k,v])=>`${v} ${k.charAt(0)+k.slice(1).toLowerCase()}`)
+      .join(' · ') || 'All Nominal';
+    return `<div class="summary-card">
+      <div class="summary-icon">${DOMAIN_ICON[domain]}</div>
+      <div class="summary-domain">${DOMAIN_LABEL[domain]}</div>
+      <div class="summary-count"><b>${results.length}</b> Monitored<br>${flags}</div>
+    </div>`;
+  }).join('');
+
+  // Alert list — sorted worst first
+  let allAssets = [];
+  Object.keys(ASSETS).forEach(domain => ASSETS[domain].forEach(a => {
+    const s = state[domain+'|'+a.key];
+    if (s?.lastResult) allAssets.push({ domain, asset:a, result:s.lastResult, prevAlert:s.prevAlert });
+  }));
+  const sorted = [...allAssets].sort((x,y)=>RANK[y.result.alert_level]-RANK[x.result.alert_level]);
+  document.getElementById('alerts-list').innerHTML = sorted.slice(0,6).map(item => {
+    const lvl = item.result.alert_level.toLowerCase();
+    const detail = item.result.alert_level==='NOMINAL'
+      ? 'Nominal — no precursor activity'
+      : `${trendLabel(item.prevAlert, item.result.alert_level)} · precursor evidence building`;
+    return `<div class="alert-item" onclick="openModal('${item.domain}','${item.asset.key}')">
+      <div class="dot dot-${lvl}"></div>
+      <div>
+        <div class="alert-name">${item.asset.name}</div>
+        <div class="alert-detail">${detail}</div>
+      </div>
+      <div class="alert-level-tag tag-${lvl}">${item.result.alert_level}</div>
+    </div>`;
+  }).join('') || '<div style="font-family:var(--mono);font-size:10px;color:var(--text-dim);">No data yet — engine loading.</div>';
+
+  // Asset cards
+  document.getElementById('asset-grid').innerHTML = allAssets.map(item => {
+    const r   = item.result;
+    const lvl = r.alert_level.toLowerCase();
+    return `<div class="asset-card" onclick="openModal('${item.domain}','${item.asset.key}')">
+      <div class="asset-card-top">
+        <div class="asset-name">${item.asset.name}</div>
+        <div class="alert-level-tag tag-${lvl}">${r.alert_level}</div>
+      </div>
+      <div class="asset-rows">
+        Confidence: <b>${(r.confidence*100).toFixed(0)}%</b><br>
+        Persistence: <b>${persistLabel(r.persistence_score)}</b><br>
+        Trend: <b>${trendLabel(item.prevAlert, r.alert_level)}</b>
+      </div>
+      <div class="asset-action">View Evidence →</div>
+    </div>`;
+  }).join('');
+}
+
+// ── EVIDENCE MODAL ────────────────────────────────────────────────────────
+function openModal(domain, assetKey) {
+  currentModalAsset = { domain, assetKey };
+  const a = ASSETS[domain].find(x=>x.key===assetKey);
+  const s = state[domain+'|'+assetKey];
+  const r = s.lastResult;
+  const ch = r.channels || {};
+
+  document.getElementById('modal-name').textContent = a.name;
+  document.getElementById('modal-sub').textContent  =
+    `${domain.toUpperCase()} · Alert: ${r.alert_level} · Confidence ${(r.confidence*100).toFixed(0)}%`;
+
+  const rows = [
+    ['Attractor drift',    driftLabel(getScore(ch.attractor_drift)),          driftLabel(getScore(ch.attractor_drift))==='rising'?'ev-rising':'ev-stable'],
+    ['Kalman pressure',    pressureLabel(getScore(ch.kappa)),                  pressureLabel(getScore(ch.kappa))==='elevated'?'ev-elevated':'ev-stable'],
+    ['b-value shift',      stressLabel(getScore(ch.b_value)),                  stressLabel(getScore(ch.b_value))==='abnormal'?'ev-abnormal':'ev-stable'],
+    ['Phase coupling',     couplingLabel(getScore(ch.plv)),                    couplingLabel(getScore(ch.plv))==='strengthening'?'ev-rising':'ev-stable'],
+    ['Temporal clustering',clusterLabel(getMeta(ch.ljung_box)),               clusterLabel(getMeta(ch.ljung_box))==='detected'?'ev-elevated':'ev-stable'],
+    ['Persistence gate',   persistLabel(r.persistence_score),                 persistLabel(r.persistence_score)==='confirmed'?'ev-confirmed':'ev-pending'],
+    ['Surrogate check',    surrogateLabel(r.surrogate_tested, r.surrogate_z), surrogateLabel(r.surrogate_tested,r.surrogate_z)==='passed'?'ev-passed':'ev-pending'],
+    ['Trend direction',    trendLabel(s.prevAlert, r.alert_level),            'ev-stable'],
+  ];
+
+  document.getElementById('modal-evidence').innerHTML = rows.map(([l,v,c]) =>
+    `<div class="evidence-row">
+       <span class="evidence-label">${l}</span>
+       <span class="evidence-value ${c}">${v}</span>
+     </div>`
+  ).join('');
+
+  document.getElementById('modal-action').textContent = getAction(r.alert_level);
+  document.getElementById('modal-overlay').classList.add('open');
+}
+
+function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+
+async function rescanCurrentAsset() {
+  if (!currentModalAsset) return;
+  const btn = document.getElementById('modal-rescan');
+  btn.disabled = true; btn.textContent = '⟳ SCANNING';
+  await scanAsset(currentModalAsset.domain, currentModalAsset.assetKey, false);
+  openModal(currentModalAsset.domain, currentModalAsset.assetKey);
+  btn.disabled = false; btn.textContent = '↻ Re-scan';
+}
+
+// ── REPORT (print-to-PDF) ─────────────────────────────────────────────────
+function printReport() {
+  if (!currentModalAsset) return;
+  const { domain, assetKey } = currentModalAsset;
+  const a  = ASSETS[domain].find(x=>x.key===assetKey);
+  const s  = state[domain+'|'+assetKey];
+  const r  = s.lastResult;
+  const ch = r.channels || {};
+
+  const lines = [
+    'PRECEPT SCOUT — HAZARD INTELLIGENCE REPORT',
+    '============================================',
+    `Asset:    ${a.name}`,
+    `Domain:   ${domain.toUpperCase()}`,
+    `Generated: ${new Date().toISOString()}`,
+    `Engine:   ${r.engine_build}`,
+    '',
+    `Alert Level:  ${r.alert_level}`,
+    `Confidence:   ${(r.confidence*100).toFixed(0)}%`,
+    `Persistence:  ${persistLabel(r.persistence_score)}`,
+    `Trend:        ${trendLabel(s.prevAlert, r.alert_level)}`,
+    '',
+    'EVIDENCE',
+    `  Attractor drift:     ${driftLabel(getScore(ch.attractor_drift))}`,
+    `  Kalman pressure:     ${pressureLabel(getScore(ch.kappa))}`,
+    `  b-value shift:       ${stressLabel(getScore(ch.b_value))}`,
+    `  Phase coupling:      ${couplingLabel(getScore(ch.plv))}`,
+    `  Temporal clustering: ${clusterLabel(getMeta(ch.ljung_box))}`,
+    `  Persistence gate:    ${persistLabel(r.persistence_score)}`,
+    `  Surrogate check:     ${surrogateLabel(r.surrogate_tested, r.surrogate_z)}`,
+    '',
+    'RECOMMENDED ACTION',
+    `  ${getAction(r.alert_level)}`,
+    '',
+    `Audit Hash: ${r.audit_hash}`,
+    '',
+    'DISCLAIMER',
+    'PRECEPT Scout · Evaluation License · AW IP Holdings Inc.',
+    'Scout Edition uses synthetic precursor waveforms through the live production engine.',
+    'Operational deployment requires empirical validation against approved instrument datasets.',
+    'Not for emergency use without validation, configuration, and authority approval.',
+  ];
+
+  const blob = new Blob([lines.join('\n')], { type:'text/plain' });
+  const link = document.createElement('a');
+  link.href     = URL.createObjectURL(blob);
+  link.download = `PRECEPT-REPORT-${assetKey}-${Date.now()}.txt`;
+  link.click();
+}
+
+// ── VERIFICATION HARNESS ───────────────────────────────────────────────────────
+async function runValidation() {
+  const btn = document.getElementById('val-run-btn');
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>RUNNING...';
+  document.getElementById('val-results').innerHTML = '';
+  try {
+    const res  = await fetch(`${API_BASE}/demo/validate/all`, { method:'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail||`Error (${res.status})`);
+    renderValidation(data);
+  } catch(e) {
+    document.getElementById('val-results').innerHTML =
+      `<div class="val-event"><div style="color:var(--red);font-family:var(--mono);font-size:11px;">Error: ${e.message}</div></div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '▶ Run Verification Harness';
+  }
+}
+
+function renderValidation(data) {
+  const results  = data.results || {};
+  const genAt    = data.generated_at ? ` · Generated: ${data.generated_at}` : '';
+  const schema   = data.schema_version ? ` · Schema: v${data.schema_version}` : '';
+  const build    = data.engine_build || '';
+  const count    = data.result_count || Object.keys(results).length;
+
+  const summary = data.summary || {};
+  const summaryHtml = summary.total != null ? `<div style="display:flex;gap:12px;margin-bottom:16px;">
+    <div style="background:rgba(0,255,136,0.08);border:1px solid var(--green);padding:12px 20px;font-family:var(--mono);font-size:11px;color:var(--green);">&#10003; PASSED: ${summary.passed}</div>
+    ${summary.failed > 0 ? `<div style="background:rgba(255,51,51,0.08);border:1px solid var(--red);padding:12px 20px;font-family:var(--mono);font-size:11px;color:var(--red);">&#10007; FAILED: ${summary.failed}</div>` : ''}
+    <div style="background:var(--panel);border:1px solid var(--border);padding:12px 20px;font-family:var(--mono);font-size:11px;color:var(--text-dim);">TOTAL: ${summary.total}</div>
+  </div>` : '';
+  const eventsHtml = Object.entries(results).map(([eventId, r]) => {
+    const pass     = r.status === 'SIM-HARNESS-PASS';
+    const conf = Number((r.confidence           ?? 0) * 100).toFixed(0);
+    const z    = Number(r.z_score_vs_noise_floor ?? 0).toFixed(2);
+    const cciLevel = Number(r.cci_peak ?? 0) >= 0.88 ? 'critical' : Number(r.cci_peak ?? 0) >= 0.78 ? 'elevated' : Number(r.cci_peak ?? 0) >= 0.65 ? 'advisory' : 'nominal';
+    const leadText = r.first_warning_window != null
+      ? `Detected precursor instability ${r.lead_time_windows} windows before the documented failure window (window ${r.first_warning_window} of ${r.total_windows}).`
+      : 'No WARNING-level precursor crossed threshold during the windowed scan.';
+    return `<div class="val-event">
+      <div class="val-event-name">${eventId.replace(/_/g,' ')}</div>
+      <div class="val-event-desc">${r.description || ''}</div>
+      <div class="val-status ${pass?'val-pass':'val-fail'}">${r.status || 'UNKNOWN'}</div>
+      <div class="val-headline">${leadText}</div>
+      <div class="val-meta">
+        Peak coherence: ${cciLevel} · Alert: ${r.alert_level || '—'} ·
+        Confidence: ${conf}% ·
+        Z-score vs noise floor: ${z}σ<br>
+        Audit Hash: ${r.audit_hash || '—'}
+      </div>
+    </div>`;
+  }).join('');
+
+  const disclaimer = data.disclaimer || '';
+  document.getElementById('val-results').innerHTML = summaryHtml + eventsHtml +
+    `<div class="val-disclaimer">
+      Results: ${count} · Engine: ${build}${genAt}${schema}<br><br>${disclaimer}
+    </div>`;
+}
+
+// ── COPY ──────────────────────────────────────────────────────────────────
+function copyBlock(id) {
+  navigator.clipboard.writeText(document.getElementById(id).textContent).catch(()=>{});
+}
+</script>
+</body>
+</html>
