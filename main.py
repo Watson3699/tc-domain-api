@@ -510,6 +510,7 @@ def session_status(session_id: str):
 
 
 @app.delete("/session/{session_id}", dependencies=[Depends(_require_key)])
+
 def session_delete(session_id: str):
     """Terminate a session and free its engine state."""
     if session_id not in _SESSIONS:
@@ -517,3 +518,236 @@ def session_delete(session_id: str):
                             detail="Session not found or expired.")
     del _SESSIONS[session_id]
     return {"session_id": session_id, "status": "terminated"}
+
+# ── Buyer trial endpoints (CSV / manual / live sensor ingestion) ──────────────
+# Trial-code gated, NOT raw API-key gated. Buyers receive a single shared
+# trial code from AW IP Holdings Inc.; this layer validates it and calls
+# the real engine using the server-side X-API-Key internally, so the
+# protected key is never sent to a buyer's browser or sensor hardware.
+
+_TRIAL_CODE = os.environ.get("PRECEPT_TRIAL_CODE", "")
+
+_TRIAL_SESSIONS: Dict[str, dict] = {}
+_TRIAL_SESSION_TTL_S = 7200   # 2 hour idle expiry — live feeds run longer than demo scans
+_MAX_TRIAL_SESSIONS  = 50
+
+_TRIAL_RATE: Dict[str, Deque[float]] = defaultdict(lambda: deque(maxlen=120))
+_TRIAL_RATE_WINDOW_S = 60
+_TRIAL_RATE_MAX      = 60     # higher than demo — supports live sensor push cadence
+
+
+def _check_trial_code(trial_code: str) -> None:
+    if not _TRIAL_CODE:
+        raise HTTPException(status_code=500, detail="Trial access not configured.")
+    if trial_code != _TRIAL_CODE:
+        raise HTTPException(status_code=401, detail="Invalid trial code.")
+
+
+def _expire_trial_sessions() -> None:
+    now  = time.time()
+    dead = [sid for sid, s in _TRIAL_SESSIONS.items()
+            if now - s["last_active"] > _TRIAL_SESSION_TTL_S]
+    for sid in dead:
+        del _TRIAL_SESSIONS[sid]
+
+
+def _check_trial_rate(request: Request) -> None:
+    ip  = request.client.host if request.client else "unknown"
+    now = time.time()
+    q   = _TRIAL_RATE[ip]
+    while q and now - q[0] > _TRIAL_RATE_WINDOW_S:
+        q.popleft()
+    if len(q) >= _TRIAL_RATE_MAX:
+        raise HTTPException(status_code=429, detail="Trial rate limit reached. Try again shortly.")
+    q.append(now)
+
+
+class TrialSessionCreateRequest(BaseModel):
+    domain:     str = Field(..., description="seismic, volcanic, or structural")
+    trial_code: str
+    fs:         float = Field(100.0, gt=0, le=100_000)
+
+
+@app.post("/trial/session/create")
+def trial_session_create(body: TrialSessionCreateRequest, request: Request):
+    _check_trial_rate(request)
+    _check_trial_code(body.trial_code)
+    _expire_trial_sessions()
+
+    if len(_TRIAL_SESSIONS) >= _MAX_TRIAL_SESSIONS:
+        raise HTTPException(status_code=429, detail="Trial capacity reached. Contact AW IP Holdings Inc.")
+    try:
+        get_domain_config(body.domain)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    session_id = str(uuid.uuid4())
+    _TRIAL_SESSIONS[session_id] = {
+        "engine":      TCEngine(domain=body.domain, fs=body.fs, enable_surrogate_gate=True),
+        "domain":      body.domain,
+        "fs":          body.fs,
+        "created_at":  time.time(),
+        "last_active": time.time(),
+        "push_count":  0,
+        "last_output": None,
+    }
+    return {
+        "session_id": session_id, "domain": body.domain, "fs": body.fs,
+        "engine_build": BUILD_TAG,
+        "push_url":   f"/trial/session/{session_id}/push",
+        "status_url": f"/trial/session/{session_id}/status",
+        "note": (
+            "POST waveform windows (JSON) to push_url — manual entry or "
+            "sensor-driven. Poll status_url for live updates."
+        ),
+    }
+
+
+class TrialPushRequest(BaseModel):
+    trial_code: str
+    waveform:   List[float] = Field(..., min_length=16, max_length=20000,
+                                    description="Signal samples, normalized to [-1, 1].")
+    magnitudes: Optional[List[float]] = None
+    mc:         float = 0.0
+    timestamp:  Optional[float] = None
+
+    @field_validator("magnitudes")
+    @classmethod
+    def _check_mags(cls, v):
+        if v is not None and len(v) < 5:
+            raise ValueError("magnitudes must contain at least 5 values.")
+        return v
+
+
+@app.post("/trial/session/{session_id}/push")
+def trial_session_push(session_id: str, body: TrialPushRequest, request: Request):
+    """
+    Generic ingestion endpoint for buyer sensor hardware OR manual entry.
+    Any device capable of an HTTP POST with a JSON body can integrate:
+    gateway script, Raspberry Pi, PLC middleware, vendor SDK, etc.
+
+    Required JSON body:
+      { "trial_code": "...", "waveform": [floats, normalized -1..1] }
+    Optional: "magnitudes" (>=5 floats), "mc", "timestamp" (unix seconds).
+    """
+    _check_trial_rate(request)
+    _check_trial_code(body.trial_code)
+    _expire_trial_sessions()
+
+    if session_id not in _TRIAL_SESSIONS:
+        raise HTTPException(status_code=404, detail="Trial session not found or expired.")
+
+    sess   = _TRIAL_SESSIONS[session_id]
+    engine: TCEngine = sess["engine"]
+
+    waveform = np.array(body.waveform, dtype=float)
+    _check_normalized(waveform)
+    mags = np.array(body.magnitudes) if body.magnitudes else None
+
+    try:
+        out = engine.analyse(waveform=waveform, magnitudes=mags, mc=body.mc, timestamp=body.timestamp)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    sess["last_active"] = time.time()
+    sess["push_count"] += 1
+    sess["last_output"] = out
+
+    response = _build_response(out, mode="session")
+    response["session_id"] = session_id
+    response["push_count"] = sess["push_count"]
+    return response
+
+
+@app.get("/trial/session/{session_id}/status")
+def trial_session_status(
+    session_id: str,
+    request: Request,
+    x_trial_code: str = Header(..., alias="X-Trial-Code"),
+):
+    _check_trial_rate(request)
+    _check_trial_code(x_trial_code)
+    _expire_trial_sessions()
+
+    if session_id not in _TRIAL_SESSIONS:
+        raise HTTPException(status_code=404, detail="Trial session not found or expired.")
+
+    sess = _TRIAL_SESSIONS[session_id]
+    out  = sess["last_output"]
+    base = {
+        "session_id": session_id, "domain": sess["domain"],
+        "push_count": sess["push_count"], "created_at": sess["created_at"],
+        "last_active": sess["last_active"], "engine_build": BUILD_TAG,
+    }
+    if out is not None:
+        base.update({
+            "cci": round(out.cci, 4), "alert_level": out.alert_level,
+            "raw_alert_level": out.raw_alert_level,
+            "persistence_score": out.persistence_score,
+            "confidence": out.confidence, "surrogate_z": out.surrogate_z,
+            "surrogate_tested": out.surrogate_tested,
+            "channels": {k: sanitize_channel_for_api(k, v) for k, v in out.channels.items()},
+            "audit_hash": out.audit_hash,
+        })
+    else:
+        base["note"] = "No data pushed yet."
+    return base
+
+
+@app.delete("/trial/session/{session_id}")
+def trial_session_delete(
+    session_id: str,
+    x_trial_code: str = Header(..., alias="X-Trial-Code"),
+):
+    _check_trial_code(x_trial_code)
+    if session_id not in _TRIAL_SESSIONS:
+        raise HTTPException(status_code=404, detail="Trial session not found or expired.")
+    del _TRIAL_SESSIONS[session_id]
+    return {"session_id": session_id, "status": "terminated"}
+
+
+@app.post("/trial/csv/{domain}")
+def trial_csv(domain: str, request: Request,
+              file: UploadFile = File(...),
+              trial_code: str = Form(...),
+              mc: float = Form(0.0),
+              fs: float = Form(100.0)):
+    """CSV waveform upload — trial-code gated screening analysis (no persistence).
+    trial_code is accepted as a form field, not a query param, so it is
+    never logged in server access logs or browser history.
+    """
+    _check_trial_rate(request)
+    _check_trial_code(trial_code)
+
+    try:
+        get_domain_config(domain)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if fs <= 0 or fs > 100_000:
+        raise HTTPException(status_code=422, detail="fs must be between 0 and 100000 Hz.")
+    if not -10 <= mc <= 10:
+        raise HTTPException(status_code=422, detail="mc must be between -10 and 10.")
+
+    try:
+        contents = file.file.read()
+        if len(contents) > 2_000_000:
+            raise HTTPException(status_code=413, detail="CSV file too large. Maximum 2 MB.")
+        data = np.genfromtxt(io.BytesIO(contents), delimiter=",")
+        data = data.flatten()
+        data = data[np.isfinite(data)]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"CSV parse error: {e}")
+
+    if len(data) < 16:
+        raise HTTPException(status_code=422, detail="CSV must contain at least 16 finite values.")
+    _check_normalized(data)
+
+    engine = TCEngine(domain=domain, fs=fs, enable_surrogate_gate=False)
+    try:
+        out = engine.analyse(waveform=data, mc=mc, apply_surrogate_gate=False)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return _build_response(out, mode="screening")
+
