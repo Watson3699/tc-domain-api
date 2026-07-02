@@ -289,9 +289,14 @@ def _normalize(sig: np.ndarray) -> WaveformArray:
 # ── PUBLIC API ────────────────────────────────────────────────────────────────
 
 def get_assets(domain: str) -> List[str]:
-    """Return list of known demo asset keys for a domain. Useful for UI dropdowns."""
-    resolved = domain if domain in DEMO_PROFILES else "seismic"
-    return list(DEMO_PROFILES[resolved].keys())
+    """
+    Return list of known demo asset keys for a domain.
+    Returns empty list for unknown domains rather than falling back silently.
+    Useful for UI dropdowns and API asset validation.
+    """
+    if domain not in DEMO_PROFILES:
+        return []
+    return list(DEMO_PROFILES[domain].keys())
 
 
 def get_demo_tape(domain: str, asset: str) -> Tuple[WaveformArray, DemoMetadata]:
@@ -315,15 +320,29 @@ def get_demo_tape(domain: str, asset: str) -> Tuple[WaveformArray, DemoMetadata]
         onset_frac = profile["onset_frac"],
     )
 
+    # Use .get with fallback for archetype so metadata is consistent
+    # even if fn fell back to the default archetype due to an unknown key.
+    resolved_archetype = _ARCHETYPES.get(
+        profile.get("archetype", ""), None
+    )
+    archetype_name = (
+        profile["archetype"]
+        if resolved_archetype is not None
+        else _FALLBACK_PROFILE["archetype"]
+    )
+
     meta: DemoMetadata = {
-        "profile_id":        f"{resolved_domain}:{asset}:{profile['archetype']}",
-        "archetype":         profile["archetype"],
+        "profile_id":        f"{resolved_domain}:{asset}:{archetype_name}",
+        "archetype":         archetype_name,
         "synthetic":         True,
         "asset":             asset,
         "domain":            resolved_domain,
         "requested_domain":  domain,
         "severity":          profile["severity"],
         "onset_frac":        profile["onset_frac"],
+        "sample_count":      _N_SAMPLES,
+        "window_size":       WINDOW_SIZE,
+        "step":              _STEP,
         "disclaimer":        PUBLIC_DEMO_DISCLAIMER,
     }
     return _normalize(raw), meta
